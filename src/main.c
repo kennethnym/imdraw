@@ -22,7 +22,74 @@
 // threshold then the entity is considered to be selected
 #define SELECT_THRESHOLD 25
 
-#define ARENA_INITIAL_SIZE 1000
+#define ARENA_INITIAL_SIZE 5000
+
+// ============================================================================
+// utils/helpers
+// ============================================================================
+
+float vec2_magnitude_sqr(const ImVec2 *v) { return v->x * v->x + v->y * v->y; }
+
+float vec2_distance_sqr(const ImVec2 *v1, const ImVec2 *v2) {
+  return (v1->x - v2->x) * (v1->x - v2->x) + (v1->y - v2->y) * (v1->y - v2->y);
+}
+
+void project_point_to_segment(ImVec2 *out, const ImVec2 *v1, const ImVec2 *v2,
+                              const ImVec2 *point) {
+  // Consider:
+  //
+  // a  = vector v1 -> point
+  // b  = vector v1 -> v2
+  // b^ = unit vector of b
+  //
+  // then:
+  //
+  // projection of a on b = (a dot b) / ||b||
+  // projection vector = (a dot b / ||b||)b^
+  //                   = (a dot b / b dot b)b
+  //
+  // resultant point from origin = v1 + projection vector
+
+  ImVec2 a = {
+      point->x - v1->x,
+      point->y - v1->y,
+  };
+  ImVec2 b = {
+      v2->x - v1->x,
+      v2->y - v1->y,
+  };
+
+  float a_dot_b = a.x * b.x + a.y * b.y;
+  // if dot product is less than zero, then the point is outside of segment v1v2
+  // closer to v1
+  if (a_dot_b < 0) {
+    out->x = v1->x;
+    out->y = v1->y;
+    return;
+  }
+
+  float b_dot_b = b.x * b.x + b.y * b.y;
+  // if a dot b > b dot b, then the projection magnitude > ||b||
+  // i.e. the point falls outside of segment v1v2 closer to v2
+  if (a_dot_b > b_dot_b) {
+    out->x = v2->x;
+    out->y = v2->y;
+    return;
+  }
+
+  float frac = a_dot_b / b_dot_b;
+
+  // v1 + projection vector = resultant
+  out->x = v1->x + frac * b.x;
+  out->y = v1->y + frac * b.y;
+}
+
+bool is_mouse_click(const ImVec2 *mouse_down_pos, const ImVec2 *mouse_up_pos) {
+  if (igIsMouseReleased_Nil(ImGuiMouseButton_Left)) {
+    return vec2_distance_sqr(mouse_up_pos, mouse_down_pos) <= CLICK_THRESHOLD;
+  }
+  return false;
+}
 
 // ============================================================================
 // struct definitions
@@ -71,6 +138,7 @@ void *arena_push(arena_t *arena, size_t size) {
 }
 
 void arena_free(arena_t *arena) {
+  printf("arena_free\n");
   for (arena_page_t *page = arena->page; page != NULL; page = page->next) {
     free(page->data);
     free(page);
@@ -162,14 +230,19 @@ typedef struct {
 } state_t;
 
 entity_t *entity_alloc(state_t *state, size_t point_count) {
+  printf("entity_alloc\n");
+
   entity_t *entity = state->freed_entity;
   if (entity) {
+    printf("recycling entity\n");
     state->freed_entity = state->freed_entity->next;
   } else {
     printf("pushing to arena\n");
     entity = arena_push(state->arena, sizeof(entity_t));
     entity->points = point_list_alloc(point_count);
   }
+
+  printf("entity alloced\n");
 
   entity->next = NULL;
   entity->prev = NULL;
@@ -184,7 +257,10 @@ void entity_recycle(state_t *state, entity_t *entity) {
   point_list_clear(&entity->points);
 }
 
-void entity_free(entity_t *entity) { point_list_free(&entity->points); }
+void entity_free(entity_t *entity) {
+  printf("entity_free\n");
+  point_list_free(&entity->points);
+}
 
 void push_entity(state_t *state, entity_t *entity) {
   entity->next = state->entites;
@@ -210,6 +286,7 @@ void remove_entity(state_t *state, entity_t *entity) {
          entity = entity->next) {
       entity_free(entity);
     }
+    state->freed_entity = NULL;
     arena_free(state->arena);
     state->arena = arena_alloc(ARENA_INITIAL_SIZE);
   } else {
@@ -217,71 +294,95 @@ void remove_entity(state_t *state, entity_t *entity) {
   }
 }
 
-// ============================================================================
-// utils/helpers
-// ============================================================================
+void create_entity(state_t *state) {
+  const ImGuiIO *io = igGetIO();
 
-float vec2_magnitude_sqr(const ImVec2 *v) { return v->x * v->x + v->y * v->y; }
+  switch (state->selected_toolbox_button) {
+  default:
+    break;
 
-float vec2_distance_sqr(const ImVec2 *v1, const ImVec2 *v2) {
-  return (v1->x - v2->x) * (v1->x - v2->x) + (v1->y - v2->y) * (v1->y - v2->y);
+  case toolbox_button_draw: {
+    if (vec2_distance_sqr(&state->drag_start, &io->MousePos) > 100) {
+      entity_t *entity = entity_alloc(state, state->points.capacity);
+      entity->flags = entity_flag_path;
+      point_list_copy(&entity->points, &state->points);
+      push_entity(state, entity);
+    }
+
+    point_list_clear(&state->points);
+
+    break;
+  }
+
+  case toolbox_button_rectangle: {
+    if (vec2_distance_sqr(&state->drag_start, &io->MousePos) > 625) {
+      entity_t *entity = entity_alloc(state, 2);
+      entity->flags = entity_flag_rect;
+      *point_list_push(&entity->points) = state->drag_start;
+      *point_list_push(&entity->points) = io->MousePos;
+      push_entity(state, entity);
+    }
+
+    break;
+  }
+  }
 }
 
-void project_point_to_segment(ImVec2 *out, const ImVec2 *v1, const ImVec2 *v2,
-                              const ImVec2 *point) {
-  // Consider:
-  //
-  // a  = vector v1 -> point
-  // b  = vector v1 -> v2
-  // b^ = unit vector of b
-  //
-  // then:
-  //
-  // projection of a on b = (a dot b) / ||b||
-  // projection vector = (a dot b / ||b||)b^
-  //                   = (a dot b / b dot b)b
-  //
-  // resultant point from origin = v1 + projection vector
+entity_t *find_selected_entity(entity_t *entities, const ImVec2 *mouse_pos) {
+  for (entity_t *entity = entities; entity != NULL; entity = entity->next) {
+    if (entity->flags & entity_flag_rect) {
+      ImVec2 *top_left = &entity->points.items[0];
+      ImVec2 *bottom_right = &entity->points.items[1];
 
-  ImVec2 a = {
-      point->x - v1->x,
-      point->y - v1->y,
-  };
-  ImVec2 b = {
-      v2->x - v1->x,
-      v2->y - v1->y,
-  };
+      if (mouse_pos->x >= top_left->x && mouse_pos->x <= bottom_right->x &&
+          mouse_pos->y >= top_left->y && mouse_pos->y <= bottom_right->y) {
+        return entity;
+      }
+    } else if (entity->flags & entity_flag_path) {
+      for (size_t i = 1; i < entity->points.length; ++i) {
+        ImVec2 *current_point = &entity->points.items[i];
+        ImVec2 *last_point = &entity->points.items[i - 1];
 
-  float a_dot_b = a.x * b.x + a.y * b.y;
-  // if dot product is less than zero, then the point is outside of segment v1v2
-  // closer to v1
-  if (a_dot_b < 0) {
-    out->x = v1->x;
-    out->y = v1->y;
-    return;
+        ImVec2 mouse_pos_proj;
+        project_point_to_segment(&mouse_pos_proj, last_point, current_point,
+                                 mouse_pos);
+
+        ImVec2 mouse_pos_delta_to_segment = {mouse_pos_proj.x - mouse_pos->x,
+                                             mouse_pos_proj.y - mouse_pos->y};
+
+        float magnitude_sqr = vec2_magnitude_sqr(&mouse_pos_delta_to_segment);
+        if (magnitude_sqr <= SELECT_THRESHOLD) {
+          return entity;
+        }
+      }
+    }
   }
 
-  float b_dot_b = b.x * b.x + b.y * b.y;
-  // if a dot b > b dot b, then the projection magnitude > ||b||
-  // i.e. the point falls outside of segment v1v2 closer to v2
-  if (a_dot_b > b_dot_b) {
-    out->x = v2->x;
-    out->y = v2->y;
-    return;
-  }
-
-  float frac = a_dot_b / b_dot_b;
-
-  // v1 + projection vector = resultant
-  out->x = v1->x + frac * b.x;
-  out->y = v1->y + frac * b.y;
+  return NULL;
 }
 
-bool is_mouse_click(const ImVec2 *mouse_down_pos, const ImVec2 *mouse_up_pos) {
-  if (igIsMouseReleased_Nil(ImGuiMouseButton_Left)) {
-    return vec2_distance_sqr(mouse_up_pos, mouse_down_pos) <= CLICK_THRESHOLD;
+// ============================================================================
+// theme
+// ============================================================================
+
+static ImU32 theme_colors[1];
+enum theme_color { theme_accent_color = 0 };
+
+// ============================================================================
+// ui functions
+// ============================================================================
+
+bool selectable_button(const char *label, const ImVec2 size,
+                       const bool is_selected) {
+  struct ImGuiStyle *style = igGetStyle();
+  if (is_selected) {
+    igPushStyleColor_U32(ImGuiCol_Button, theme_colors[theme_accent_color]);
+  } else {
+    igPushStyleColor_U32(ImGuiCol_Button, 0);
   }
-  return false;
+  const bool clicked = igButton(label, size);
+  igPopStyleColor(1);
+  return clicked;
 }
 
 // ============================================================================
@@ -299,17 +400,19 @@ static void init(void) {
       .logger.func = slog_func,
   });
 
+  theme_colors[theme_accent_color] =
+      igGetColorU32_Vec4((ImVec4){0.114, 0.435, 1, 1});
+
   struct ImGuiIO *io = igGetIO();
 
   struct ImFontConfig *config = ImFontConfig_ImFontConfig();
-  config->MergeMode = true;
-  config->GlyphMinAdvanceX = 13.0f;
+  config->GlyphMinAdvanceX = 16.0f;
   config->FontDataOwnedByAtlas = false;
 
-  static const ImWchar icon_ranges[] = {ICON_MIN_FA, ICON_MAX_FA};
+  static const ImWchar icon_ranges[] = {ICON_MIN_FA, ICON_MAX_FA, 0};
 
   state.fa_font = ImFontAtlas_AddFontFromMemoryTTF(
-      io->Fonts, FA4_TTF, FA4_TTF_SIZE, 16.0f, config, icon_ranges);
+      io->Fonts, fa4_ttf, FA4_TTF_SIZE, 16.0f, config, icon_ranges);
 
   state.arena = arena_alloc(ARENA_INITIAL_SIZE);
   state.points = point_list_alloc(100);
@@ -338,6 +441,7 @@ static void frame(void) {
   igSetNextWindowSize(viewport->WorkSize, ImGuiCond_Always);
   igSetNextWindowViewport(viewport->ID);
   igPushStyleVar_Float(ImGuiStyleVar_WindowRounding, 0.0f);
+  igPushStyleVar_Float(ImGuiStyleVar_WindowBorderSize, 0.0f);
 
   igBegin("canvas", 0,
           ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoResize |
@@ -355,10 +459,13 @@ static void frame(void) {
       state.drag_start = io->MousePos;
     } else {
       state.is_prev_dragging = true;
-      state.selected_entity = NULL;
     }
   } else {
     state.is_dragging = false;
+    if (state.is_prev_dragging) {
+      create_entity(&state);
+    }
+    state.is_prev_dragging = false;
   }
 
   switch (state.selected_toolbox_button) {
@@ -366,34 +473,17 @@ static void frame(void) {
     break;
 
   case toolbox_button_select: {
-    if (is_mouse_click(&state.drag_start, &io->MousePos)) {
-      bool has_selected_entity = false;
-
-      for (entity_t *entity = state.entites; entity != NULL;
-           entity = entity->next) {
-        for (size_t i = 1; i < entity->points.length; ++i) {
-          ImVec2 *current_point = &entity->points.items[i];
-          ImVec2 *last_point = &entity->points.items[i - 1];
-
-          ImVec2 mouse_pos_proj;
-          project_point_to_segment(&mouse_pos_proj, last_point, current_point,
-                                   &io->MousePos);
-
-          ImVec2 mouse_pos_delta_to_segment = {
-              mouse_pos_proj.x - io->MousePos.x,
-              mouse_pos_proj.y - io->MousePos.y};
-
-          float magnitude_sqr = vec2_magnitude_sqr(&mouse_pos_delta_to_segment);
-          if (magnitude_sqr <= SELECT_THRESHOLD) {
-            has_selected_entity = true;
-            state.selected_entity = entity;
-            break;
-          }
-        }
-      }
-
-      if (!has_selected_entity) {
-        state.selected_entity = NULL;
+    if (state.is_dragging && !state.is_prev_dragging) {
+      state.selected_entity =
+          find_selected_entity(state.entites, &io->MousePos);
+    } else if (state.is_dragging && state.selected_entity) {
+      float delta_x = io->MousePos.x - state.last_mouse_pos.x;
+      float delta_y = io->MousePos.y - state.last_mouse_pos.y;
+      const size_t no_of_points = state.selected_entity->points.length;
+      for (size_t i = 0; i < no_of_points; ++i) {
+        ImVec2 *pt = state.selected_entity->points.items + i;
+        pt->x += delta_x;
+        pt->y += delta_y;
       }
     }
     break;
@@ -403,14 +493,6 @@ static void frame(void) {
     if (state.is_dragging && (state.last_mouse_pos.x != io->MousePos.x ||
                               state.last_mouse_pos.y != io->MousePos.y)) {
       *point_list_push(&state.points) = io->MousePos;
-    } else if (!state.is_dragging && state.is_prev_dragging &&
-               state.points.length > 0) {
-      entity_t *entity = entity_alloc(&state, state.points.capacity);
-      entity->flags = entity_flag_path;
-      point_list_copy(&entity->points, &state.points);
-      push_entity(&state, entity);
-      point_list_clear(&state.points);
-      state.is_prev_dragging = false;
     }
 
     for (size_t i = 1; i < state.points.length; ++i) {
@@ -420,10 +502,16 @@ static void frame(void) {
 
     break;
   }
+
+  case toolbox_button_rectangle:
+    if (state.is_dragging) {
+      ImDrawList_AddRectFilled(draw_list, state.drag_start, io->MousePos,
+                               0xFFFFFFFF, 0.0f, ImDrawFlags_None);
+    }
   }
 
   if (igIsKeyPressed_Bool(ImGuiKey_Backspace, false)) {
-    if (state.entites) {
+    if (state.selected_entity) {
       remove_entity(&state, state.selected_entity);
       state.selected_entity = NULL;
     }
@@ -440,18 +528,31 @@ static void frame(void) {
         ImU32 color = entity == state.selected_entity ? 0xFF0000FF : 0xFFFFFFFF;
         ImDrawList_AddLine(draw_list, *last_point, *current_point, color, 2);
       }
+    } else if (entity->flags & entity_flag_rect) {
+      ImDrawList_AddRectFilled(draw_list, entity->points.items[0],
+                               entity->points.items[1], 0xFFFFFFFF, 0.0,
+                               ImDrawFlags_None);
+
+      if (state.selected_entity == entity) {
+        ImDrawList_AddRect(draw_list, entity->points.items[0],
+                           entity->points.items[1],
+                           igGetColorU32_Vec4((ImVec4){0.537, 0.706, 1, 1}),
+                           0.0, ImDrawFlags_None, 2.0);
+      }
     }
   }
 
-  igShowMetricsWindow(NULL);
+  igSetNextWindowPos((ImVec2){io->DisplaySize.x * 0.5, 16}, ImGuiCond_Always,
+                     (ImVec2){0.5, 0});
+
+  toolbox_window();
 
   state.last_mouse_pos = io->MousePos;
 
-  igSetNextWindowPos(viewport->WorkPos, ImGuiCond_None, (ImVec2){0, 0});
-  toolbox_window();
+  igShowMetricsWindow(NULL);
 
   igEnd();
-  igPopStyleVar(1);
+  igPopStyleVar(2);
 
   sg_begin_pass(&(sg_pass){
       .action = state.pass_action,
@@ -465,24 +566,38 @@ static void frame(void) {
 static void toolbox_window(void) {
   static ImVec2 button_size = {24, 24};
 
-  igBegin(ICON_FA_COG, 0, ImGuiWindowFlags_NoResize);
+  igPushFont(state.fa_font);
 
-  igPushStyleVar_Vec2(ImGuiStyleVar_ButtonTextAlign, (ImVec2){1, 1});
-  igPushStyleColor_U32(ImGuiCol_Button, 0);
+  igPushStyleVar_Float(ImGuiStyleVar_WindowBorderSize, 1.0);
+  igPushStyleVar_Vec2(ImGuiStyleVar_ButtonTextAlign, (ImVec2){1, 0.9});
 
-  if (igButton(ICON_FA_MOUSE_POINTER, button_size)) {
+  igBegin("t", 0, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoTitleBar);
+
+  if (selectable_button(ICON_FA_MOUSE_POINTER, button_size,
+                        state.selected_toolbox_button ==
+                            toolbox_button_select)) {
     state.selected_toolbox_button = toolbox_button_select;
   };
-  if (igButton(ICON_FA_PENCIL, button_size)) {
+
+  igSameLine(0, 4);
+
+  if (selectable_button(ICON_FA_PENCIL, button_size,
+                        state.selected_toolbox_button == toolbox_button_draw)) {
     state.selected_toolbox_button = toolbox_button_draw;
   };
 
-  igPushStyleVar_Vec2(ImGuiStyleVar_ButtonTextAlign, (ImVec2){0.8, 1});
-  igButton(ICON_FA_SQUARE_O, button_size);
-  igPopStyleVar(1);
+  igSameLine(0, 4);
 
-  igPopStyleVar(1);
-  igPopStyleColor(1);
+  igPushStyleVar_Vec2(ImGuiStyleVar_ButtonTextAlign, (ImVec2){0.8, 1});
+
+  if (selectable_button(ICON_FA_SQUARE_O, button_size,
+                        state.selected_toolbox_button ==
+                            toolbox_button_rectangle)) {
+    state.selected_toolbox_button = toolbox_button_rectangle;
+  };
+
+  igPopStyleVar(3);
+  igPopFont();
 
   igEnd();
 }
@@ -505,5 +620,6 @@ sapp_desc sokol_main(int argc, char *argv[]) {
       .height = 480,
       .window_title = "ImDraw",
       .icon.sokol_default = true,
+      .high_dpi = true,
   };
 }
