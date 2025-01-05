@@ -1,0 +1,6 @@
+CompileFlags:
+  Add:
+    - -I/Users/kennethng/Projects/imdraw/vendor/cimgui
+    - -I/Users/kennethng/Projects/imdraw/vendor/imgui
+    - -I/Users/kennethng/Projects/imdraw/vendor/sokol
+    - -I/Users/kennethng/Projects/imdraw/vendor/sokol/util
