@@ -262,8 +262,9 @@ typedef struct {
   entity_t *selected_entity;
   bool is_area_selecting;
 
-  bool is_dragging;
-  bool is_prev_dragging;
+  bool is_mouse_down;
+  bool is_prev_mouse_down;
+  bool is_moving_entities;
   point_list_t points;
   ImVec2 drag_start;
   ImVec2 last_mouse_pos;
@@ -496,7 +497,7 @@ static void init(void) {
   state.points = point_list_alloc(100);
   state.last_mouse_pos.x = 0;
   state.last_mouse_pos.y = 0;
-  state.is_dragging = false;
+  state.is_mouse_down = false;
   state.pass_action.colors[0].load_action = SG_LOADACTION_CLEAR;
   state.selected_entity = NULL;
   state.has_selected_entities = false;
@@ -535,23 +536,22 @@ static void frame(void) {
   igInvisibleButton("canvas", viewport->WorkSize, ImGuiButtonFlags_None);
 
   if (igIsMouseDown_Nil(ImGuiMouseButton_Left)) {
-    if (!state.is_dragging) {
-      state.is_dragging = true;
-      state.is_prev_dragging = false;
+    if (!state.is_mouse_down) {
+      state.is_mouse_down = true;
+      state.is_prev_mouse_down = false;
       state.drag_start = io->MousePos;
     } else {
-      state.is_prev_dragging = true;
+      state.is_prev_mouse_down = true;
     }
   } else {
-    state.is_dragging = false;
-    if (state.is_prev_dragging) {
+    state.is_mouse_down = false;
+    if (state.is_prev_mouse_down) {
       create_entity(&state);
     }
-    state.is_prev_dragging = false;
+    state.is_prev_mouse_down = false;
   }
 
   ImVec2 move_entity_by = {0, 0};
-  bool is_moving_entities = false;
   entity_t *selected_entity = NULL;
   bool should_clear_prev_selections = false;
   ImU32 current_picked_color = igGetColorU32_Vec4(state.picked_color.Value);
@@ -561,11 +561,11 @@ static void frame(void) {
     break;
 
   case toolbox_button_select: {
-    if (state.is_dragging &&
+    if (state.is_mouse_down &&
         !vec2_is_in_area(&io->MousePos,
                          &state.color_picker_window.position_top_left,
                          &state.color_picker_window.position_bottom_right)) {
-      if (!state.is_prev_dragging) {
+      if (!state.is_prev_mouse_down) {
         selected_entity = find_entity_near_mouse(&state, &io->MousePos);
         if (selected_entity) {
           if ((selected_entity->flags & entity_flag_selected) == 0) {
@@ -574,24 +574,28 @@ static void frame(void) {
           }
           state.has_selected_entities = true;
         } else {
-          printf("should clear prev selections\n");
           should_clear_prev_selections = true;
           state.has_selected_entities = false;
         }
       } else if (state.has_selected_entities && !state.is_area_selecting) {
         selected_entity = find_entity_near_mouse(&state, &io->MousePos);
-        if (selected_entity && selected_entity->flags & entity_flag_selected) {
-          is_moving_entities = true;
+        if ((selected_entity &&
+             selected_entity->flags & entity_flag_selected) ||
+            state.is_moving_entities) {
+          state.is_moving_entities = true;
           move_entity_by.x = io->MousePos.x - state.last_mouse_pos.x;
           move_entity_by.y = io->MousePos.y - state.last_mouse_pos.y;
         }
-      } else {
+      } else if (!state.is_moving_entities) {
         state.is_area_selecting = true;
         select_entities_in_area(&state, &state.drag_start, &io->MousePos);
       }
     } else {
       if (state.is_area_selecting) {
         state.is_area_selecting = false;
+      }
+      if (state.is_moving_entities) {
+        state.is_moving_entities = false;
       }
     }
     break;
@@ -707,7 +711,8 @@ static void frame(void) {
     break;
 
   case toolbox_button_select: {
-    if (state.is_dragging && state.is_prev_dragging && !is_moving_entities) {
+    if (state.is_mouse_down && state.is_prev_mouse_down &&
+        !state.is_moving_entities) {
       ImDrawList_AddRect(draw_list, state.drag_start, io->MousePos, 0xFFFFFFFF,
                          0.0f, ImDrawFlags_None, 1);
     }
@@ -715,7 +720,7 @@ static void frame(void) {
   }
 
   case toolbox_button_rectangle:
-    if (state.is_dragging) {
+    if (state.is_mouse_down) {
       ImDrawList_AddRectFilled(draw_list, state.drag_start, io->MousePos,
                                igGetColorU32_Vec4(state.picked_color.Value),
                                0.0f, ImDrawFlags_None);
@@ -723,8 +728,8 @@ static void frame(void) {
     break;
 
   case toolbox_button_draw: {
-    if (state.is_dragging && (state.last_mouse_pos.x != io->MousePos.x ||
-                              state.last_mouse_pos.y != io->MousePos.y)) {
+    if (state.is_mouse_down && (state.last_mouse_pos.x != io->MousePos.x ||
+                                state.last_mouse_pos.y != io->MousePos.y)) {
       *point_list_push(&state.points) = io->MousePos;
     }
 
