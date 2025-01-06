@@ -216,6 +216,7 @@ typedef struct entity {
   entity_flag_t flags;
 
   point_list_t points;
+  ImColor color;
 
   struct entity *next;
   struct entity *prev;
@@ -225,6 +226,16 @@ typedef struct selected_entity {
   entity_t *entity;
   struct selected_entity *next;
 } selected_entity_t;
+
+// ===========================
+// struct: window info
+// ===========================
+
+typedef struct {
+  ImVec2 dimension;
+  ImVec2 position_top_left;
+  ImVec2 position_bottom_right;
+} window_info_t;
 
 // ===========================
 // struct: game state
@@ -237,26 +248,29 @@ typedef enum {
 } toolbox_button_kind_t;
 
 typedef struct {
-  ImFont *fa_font;
-
   arena_t *arena;
+
+  ImFont *fa_font;
+  sg_pass_action pass_action;
+
+  window_info_t color_picker_window;
+  ImVec2 color_picker_window_size;
 
   entity_t *entities;
   entity_t *freed_entity;
-
-  sg_pass_action pass_action;
+  bool has_selected_entities;
+  entity_t *selected_entity;
+  bool is_area_selecting;
 
   bool is_dragging;
   bool is_prev_dragging;
   point_list_t points;
   ImVec2 drag_start;
   ImVec2 last_mouse_pos;
-  entity_t *selected_entity;
-  bool is_area_selecting;
-  size_t selected_entities_count;
-  bool has_selected_entities;
 
   toolbox_button_kind_t selected_toolbox_button;
+  bool is_color_picker_changing;
+  ImColor picked_color;
 } state_t;
 
 entity_t *entity_alloc(state_t *state, size_t point_count) {
@@ -338,6 +352,7 @@ void create_entity(state_t *state) {
     if (vec2_distance_sqr(&state->drag_start, &io->MousePos) > 100) {
       entity_t *entity = entity_alloc(state, state->points.capacity);
       entity->flags = entity_flag_path;
+      entity->color = state->picked_color;
       point_list_copy(&entity->points, &state->points);
       push_entity(state, entity);
     }
@@ -351,6 +366,7 @@ void create_entity(state_t *state) {
     if (vec2_distance_sqr(&state->drag_start, &io->MousePos) > 625) {
       entity_t *entity = entity_alloc(state, 2);
       entity->flags = entity_flag_rect;
+      entity->color = state->picked_color;
       *point_list_push(&entity->points) = state->drag_start;
       *point_list_push(&entity->points) =
           (ImVec2){io->MousePos.x, state->drag_start.y};
@@ -365,79 +381,12 @@ void create_entity(state_t *state) {
   }
 }
 
-typedef struct {
-  entity_t *selected_entity;
-  bool should_clear_prev_selection;
-} select_single_entity_result_t;
-
-void select_entity_near_mouse(select_single_entity_result_t *result,
-                              state_t *state, const ImVec2 *mouse_pos) {
-  size_t selected_entities_count = 0;
-  bool should_clear_prev_selection = true;
-
-  for (entity_t *entity = state->entities; entity != NULL;
-       entity = entity->next) {
-    const bool is_prev_selected = entity->flags & entity_flag_selected;
-
-    if (entity->flags & entity_flag_rect) {
-      ImVec2 *top_left = &entity->points.items[0];
-      ImVec2 *bottom_right = &entity->points.items[2];
-
-      if (vec2_is_in_area(mouse_pos, top_left, bottom_right)) {
-        if (is_prev_selected) {
-          should_clear_prev_selection = false;
-        } else {
-          entity->flags |= entity_flag_selected;
-        }
-        selected_entities_count++;
-      } else if (is_prev_selected) {
-        if (should_clear_prev_selection) {
-          entity->flags &= ~entity_flag_selected;
-        } else {
-          selected_entities_count++;
-        }
-      }
-    } else if (entity->flags & entity_flag_path) {
-      for (size_t i = 1; i < entity->points.length; ++i) {
-        ImVec2 *current_point = &entity->points.items[i];
-        ImVec2 *last_point = &entity->points.items[i - 1];
-
-        ImVec2 mouse_pos_proj;
-        project_point_to_segment(&mouse_pos_proj, last_point, current_point,
-                                 mouse_pos);
-
-        ImVec2 mouse_pos_delta_to_segment = {mouse_pos_proj.x - mouse_pos->x,
-                                             mouse_pos_proj.y - mouse_pos->y};
-
-        float magnitude_sqr = vec2_magnitude_sqr(&mouse_pos_delta_to_segment);
-        if (magnitude_sqr <= SELECT_THRESHOLD) {
-          if (is_prev_selected) {
-            should_clear_prev_selection = false;
-          } else {
-            entity->flags |= entity_flag_selected;
-          }
-          selected_entities_count++;
-          break;
-        } else if (is_prev_selected) {
-          if (should_clear_prev_selection) {
-            entity->flags &= ~entity_flag_selected;
-          } else {
-            selected_entities_count++;
-          }
-        }
-      }
-    }
-  }
-
-  state->selected_entities_count = selected_entities_count;
-}
-
 entity_t *find_entity_near_mouse(state_t *state, const ImVec2 *mouse_pos) {
   for (entity_t *entity = state->entities; entity != NULL;
        entity = entity->next) {
     if (entity->flags & entity_flag_rect) {
-      ImVec2 *top_left = &entity->points.items[0];
-      ImVec2 *bottom_right = &entity->points.items[2];
+      ImVec2 *top_left = entity->points.items;
+      ImVec2 *bottom_right = entity->points.items + 2;
 
       if (vec2_is_in_area(mouse_pos, top_left, bottom_right)) {
         return entity;
@@ -487,7 +436,7 @@ void select_entities_in_area(state_t *state, const ImVec2 *top_left,
     }
   }
 
-  state->selected_entities_count = has_selected_entities;
+  state->has_selected_entities = has_selected_entities;
 }
 
 // ============================================================================
@@ -550,11 +499,15 @@ static void init(void) {
   state.is_dragging = false;
   state.pass_action.colors[0].load_action = SG_LOADACTION_CLEAR;
   state.selected_entity = NULL;
-
+  state.has_selected_entities = false;
   state.selected_toolbox_button = toolbox_button_select;
+  state.picked_color = *ImColor_ImColor_U32(0xFFFFFFFF);
+  state.color_picker_window_size.x = 0;
+  state.color_picker_window_size.y = 0;
 }
 
 static void toolbox_window(void);
+static void color_picker_window(void);
 
 static void frame(void) {
   simgui_new_frame(&(simgui_frame_desc_t){
@@ -601,13 +554,17 @@ static void frame(void) {
   bool is_moving_entities = false;
   entity_t *selected_entity = NULL;
   bool should_clear_prev_selections = false;
+  ImU32 current_picked_color = igGetColorU32_Vec4(state.picked_color.Value);
 
   switch (state.selected_toolbox_button) {
   default:
     break;
 
   case toolbox_button_select: {
-    if (state.is_dragging) {
+    if (state.is_dragging &&
+        !vec2_is_in_area(&io->MousePos,
+                         &state.color_picker_window.position_top_left,
+                         &state.color_picker_window.position_bottom_right)) {
       if (!state.is_prev_dragging) {
         selected_entity = find_entity_near_mouse(&state, &io->MousePos);
         if (selected_entity) {
@@ -617,6 +574,7 @@ static void frame(void) {
           }
           state.has_selected_entities = true;
         } else {
+          printf("should clear prev selections\n");
           should_clear_prev_selections = true;
           state.has_selected_entities = false;
         }
@@ -644,6 +602,33 @@ static void frame(void) {
     remove_selected_entites(&state);
   }
 
+  igSetNextWindowPos((ImVec2){io->DisplaySize.x * 0.5, 16}, ImGuiCond_Always,
+                     (ImVec2){0.5, 0});
+
+  toolbox_window();
+
+  if (state.color_picker_window.dimension.x > 0) {
+    ImVec2 *top_left = &state.color_picker_window.position_top_left;
+    ImVec2 *bottom_right = &state.color_picker_window.position_bottom_right;
+
+    top_left->x =
+        io->DisplaySize.x - state.color_picker_window.dimension.x - 16;
+    top_left->y = 16;
+    bottom_right->x = top_left->x + state.color_picker_window.dimension.x;
+    bottom_right->y = top_left->y + state.color_picker_window.dimension.y;
+
+    igSetNextWindowPos(*top_left, ImGuiCond_Always, (ImVec2){0, 0});
+  } else {
+    igSetNextWindowPos((ImVec2){0, 0}, ImGuiCond_Always, (ImVec2){0, 0});
+  }
+
+  color_picker_window();
+
+  igSetNextWindowPos((ImVec2){0, io->DisplaySize.y}, ImGuiCond_Always,
+                     (ImVec2){0, 1});
+  igSetNextWindowCollapsed(true, ImGuiCond_Once);
+  igShowMetricsWindow(NULL);
+
   //======= draw entities to canvas =========
 
   for (entity_t *entity = state.entities; entity != NULL;
@@ -657,7 +642,16 @@ static void frame(void) {
     }
 
     if (entity->flags & entity_flag_path) {
-      for (size_t i = 1; i < entity->points.length; ++i) {
+      ImU32 fill_color;
+      if (is_selected && state.is_color_picker_changing) {
+        fill_color = current_picked_color;
+        entity->color = state.picked_color;
+      } else {
+        fill_color = current_picked_color;
+      }
+
+      const size_t no_of_points = entity->points.length;
+      for (size_t i = 1; i < no_of_points; ++i) {
         ImVec2 *current_point = &entity->points.items[i];
         ImVec2 *last_point = &entity->points.items[i - 1];
 
@@ -668,9 +662,18 @@ static void frame(void) {
           vec2_move(current_point, &move_entity_by);
         }
 
-        ImU32 color =
-            (entity->flags & entity_flag_selected) ? 0xFF0000FF : 0xFFFFFFFF;
-        ImDrawList_AddLine(draw_list, *last_point, *current_point, color, 2);
+        ImDrawList_AddLine(draw_list, *last_point, *current_point, fill_color,
+                           2);
+
+        if (is_selected) {
+          if (i == 1) {
+            ImDrawList_AddCircleFilled(draw_list, *last_point, 4, 0xFFFFFFFF,
+                                       10);
+          } else if (i == no_of_points - 1) {
+            ImDrawList_AddCircleFilled(draw_list, *current_point, 4, 0xFFFFFFFF,
+                                       10);
+          }
+        }
       }
     } else if (entity->flags & entity_flag_rect) {
       if (is_selected) {
@@ -678,8 +681,16 @@ static void frame(void) {
         vec2_move(entity->points.items + 2, &move_entity_by);
       }
 
+      ImU32 fill_color;
+      if (is_selected && state.is_color_picker_changing) {
+        fill_color = current_picked_color;
+        entity->color = state.picked_color;
+      } else {
+        fill_color = current_picked_color;
+      }
+
       ImDrawList_AddRectFilled(draw_list, entity->points.items[0],
-                               entity->points.items[2], 0xFFFFFFFF, 0.0,
+                               entity->points.items[2], fill_color, 0.0,
                                ImDrawFlags_None);
 
       if (is_selected) {
@@ -690,11 +701,6 @@ static void frame(void) {
       }
     }
   }
-
-  igSetNextWindowPos((ImVec2){io->DisplaySize.x * 0.5, 16}, ImGuiCond_Always,
-                     (ImVec2){0.5, 0});
-
-  toolbox_window();
 
   switch (state.selected_toolbox_button) {
   default:
@@ -711,7 +717,8 @@ static void frame(void) {
   case toolbox_button_rectangle:
     if (state.is_dragging) {
       ImDrawList_AddRectFilled(draw_list, state.drag_start, io->MousePos,
-                               0xFFFFFFFF, 0.0f, ImDrawFlags_None);
+                               igGetColorU32_Vec4(state.picked_color.Value),
+                               0.0f, ImDrawFlags_None);
     }
     break;
 
@@ -723,7 +730,7 @@ static void frame(void) {
 
     for (size_t i = 1; i < state.points.length; ++i) {
       ImDrawList_AddLine(draw_list, state.points.items[i - 1],
-                         state.points.items[i], 0xFFFFFFFF, 2);
+                         state.points.items[i], current_picked_color, 2);
     }
 
     break;
@@ -731,8 +738,6 @@ static void frame(void) {
   }
 
   state.last_mouse_pos = io->MousePos;
-
-  igShowMetricsWindow(NULL);
 
   igEnd();
   igPopStyleVar(2);
@@ -781,6 +786,20 @@ static void toolbox_window(void) {
 
   igPopStyleVar(3);
   igPopFont();
+
+  igEnd();
+}
+
+static void color_picker_window(void) {
+  igBegin("Colors", 0, ImGuiWindowFlags_AlwaysAutoResize);
+
+  igGetWindowSize(&state.color_picker_window.dimension);
+
+  state.is_color_picker_changing = igColorPicker4(
+      "Color", (float *)&state.picked_color,
+      ImGuiColorEditFlags_NoLabel | ImGuiColorEditFlags_NoInputs |
+          ImGuiColorEditFlags_AlphaBar | ImGuiColorEditFlags_AlphaPreview,
+      NULL);
 
   igEnd();
 }
