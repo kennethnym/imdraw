@@ -268,6 +268,7 @@ entity_t *entity_alloc(state_t *state, size_t point_count) {
     entity->points = point_list_alloc(point_count);
   }
 
+  entity->flags = 0;
   entity->next = NULL;
   entity->prev = NULL;
 
@@ -281,10 +282,7 @@ void entity_recycle(state_t *state, entity_t *entity) {
   point_list_clear(&entity->points);
 }
 
-void entity_free(entity_t *entity) {
-  printf("entity_free\n");
-  point_list_free(&entity->points);
-}
+void entity_free(entity_t *entity) { point_list_free(&entity->points); }
 
 void push_entity(state_t *state, entity_t *entity) {
   entity->next = state->entities;
@@ -294,15 +292,26 @@ void push_entity(state_t *state, entity_t *entity) {
   state->entities = entity;
 }
 
-void remove_entity(state_t *state, entity_t *entity) {
-  if (state->entities == entity) {
-    state->entities = entity->next;
-  }
-  if (entity->prev) {
-    entity->prev->next = entity->next;
-  }
-  if (entity->next) {
-    entity->next->prev = entity->prev;
+void remove_selected_entites(state_t *state) {
+  entity_t *last_removed_entity = NULL;
+  for (entity_t *entity = state->entities; entity != NULL;
+       entity = entity->next) {
+    if (last_removed_entity) {
+      entity_recycle(state, last_removed_entity);
+      last_removed_entity = NULL;
+    }
+    if (entity->flags & entity_flag_selected) {
+      if (state->entities == entity) {
+        state->entities = entity->next;
+      }
+      if (entity->prev) {
+        entity->prev->next = entity->next;
+      }
+      if (entity->next) {
+        entity->next->prev = entity->prev;
+      }
+      last_removed_entity = entity;
+    }
   }
 
   if (state->entities == NULL) {
@@ -313,18 +322,9 @@ void remove_entity(state_t *state, entity_t *entity) {
     state->freed_entity = NULL;
     arena_free(state->arena);
     state->arena = arena_alloc(ARENA_INITIAL_SIZE);
-  } else {
-    entity_recycle(state, entity);
   }
-}
 
-void remove_selected_entites(state_t *state) {
-  for (entity_t *entity = state->entities; entity != NULL;
-       entity = entity->next) {
-    if (entity->flags & entity_flag_selected) {
-      remove_entity(state, entity);
-    }
-  }
+  state->has_selected_entities = false;
 }
 
 void create_entity(state_t *state) {
@@ -642,7 +642,6 @@ static void frame(void) {
 
   if (igIsKeyPressed_Bool(ImGuiKey_Backspace, false)) {
     remove_selected_entites(&state);
-    state.has_selected_entities = false;
   }
 
   //======= draw entities to canvas =========
