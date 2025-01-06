@@ -652,6 +652,7 @@ static void frame(void) {
         entity->color = state.picked_color;
       } else {
         fill_color = current_picked_color;
+        fill_color = igGetColorU32_Vec4(entity->color.Value);
       }
 
       const size_t no_of_points = entity->points.length;
@@ -691,6 +692,7 @@ static void frame(void) {
         entity->color = state.picked_color;
       } else {
         fill_color = current_picked_color;
+        fill_color = igGetColorU32_Vec4(entity->color.Value);
       }
 
       ImDrawList_AddRectFilled(draw_list, entity->points.items[0],
