@@ -84,6 +84,23 @@ void project_point_to_segment(ImVec2 *out, const ImVec2 *v1, const ImVec2 *v2,
   out->y = v1->y + frac * b.y;
 }
 
+void vec2_move(ImVec2 *vec, const ImVec2 *delta) {
+  vec->x += delta->x;
+  vec->y += delta->y;
+}
+
+bool vec2_is_in_area(const ImVec2 *vec, const ImVec2 *point_a,
+                     const ImVec2 *point_b) {
+  float a_to_vec_delta_x = vec->x - point_a->x;
+  float b_to_vec_delta_x = vec->x - point_b->x;
+  float a_to_vec_delta_y = vec->y - point_a->y;
+  float b_to_vec_delta_y = vec->y - point_b->y;
+  return (a_to_vec_delta_x >= 0 && b_to_vec_delta_x <= 0 ||
+          b_to_vec_delta_x >= 0 && a_to_vec_delta_x <= 0) &&
+         (a_to_vec_delta_y >= 0 && b_to_vec_delta_y <= 0 ||
+          b_to_vec_delta_y >= 0 && a_to_vec_delta_y <= 0);
+}
+
 bool is_mouse_click(const ImVec2 *mouse_down_pos, const ImVec2 *mouse_up_pos) {
   if (igIsMouseReleased_Nil(ImGuiMouseButton_Left)) {
     return vec2_distance_sqr(mouse_up_pos, mouse_down_pos) <= CLICK_THRESHOLD;
@@ -189,7 +206,11 @@ void point_list_free(point_list_t *list) { free(list->items); }
 // struct: entity
 // ===========================
 
-typedef enum { entity_flag_rect = 1, entity_flag_path = 1 << 1 } entity_flag_t;
+typedef enum {
+  entity_flag_rect = 1 << 0,
+  entity_flag_path = 1 << 1,
+  entity_flag_selected = 1 << 2,
+} entity_flag_t;
 
 typedef struct entity {
   entity_flag_t flags;
@@ -199,6 +220,11 @@ typedef struct entity {
   struct entity *next;
   struct entity *prev;
 } entity_t;
+
+typedef struct selected_entity {
+  entity_t *entity;
+  struct selected_entity *next;
+} selected_entity_t;
 
 // ===========================
 // struct: game state
@@ -214,7 +240,8 @@ typedef struct {
   ImFont *fa_font;
 
   arena_t *arena;
-  entity_t *entites;
+
+  entity_t *entities;
   entity_t *freed_entity;
 
   sg_pass_action pass_action;
@@ -225,24 +252,21 @@ typedef struct {
   ImVec2 drag_start;
   ImVec2 last_mouse_pos;
   entity_t *selected_entity;
+  bool is_area_selecting;
+  size_t selected_entities_count;
+  bool has_selected_entities;
 
   toolbox_button_kind_t selected_toolbox_button;
 } state_t;
 
 entity_t *entity_alloc(state_t *state, size_t point_count) {
-  printf("entity_alloc\n");
-
   entity_t *entity = state->freed_entity;
   if (entity) {
-    printf("recycling entity\n");
     state->freed_entity = state->freed_entity->next;
   } else {
-    printf("pushing to arena\n");
     entity = arena_push(state->arena, sizeof(entity_t));
     entity->points = point_list_alloc(point_count);
   }
-
-  printf("entity alloced\n");
 
   entity->next = NULL;
   entity->prev = NULL;
@@ -263,16 +287,16 @@ void entity_free(entity_t *entity) {
 }
 
 void push_entity(state_t *state, entity_t *entity) {
-  entity->next = state->entites;
-  if (state->entites) {
-    state->entites->prev = entity;
+  entity->next = state->entities;
+  if (state->entities) {
+    state->entities->prev = entity;
   }
-  state->entites = entity;
+  state->entities = entity;
 }
 
 void remove_entity(state_t *state, entity_t *entity) {
-  if (state->entites == entity) {
-    state->entites = entity->next;
+  if (state->entities == entity) {
+    state->entities = entity->next;
   }
   if (entity->prev) {
     entity->prev->next = entity->next;
@@ -281,7 +305,7 @@ void remove_entity(state_t *state, entity_t *entity) {
     entity->next->prev = entity->prev;
   }
 
-  if (state->entites == NULL) {
+  if (state->entities == NULL) {
     for (entity_t *entity = state->freed_entity; entity != NULL;
          entity = entity->next) {
       entity_free(entity);
@@ -291,6 +315,15 @@ void remove_entity(state_t *state, entity_t *entity) {
     state->arena = arena_alloc(ARENA_INITIAL_SIZE);
   } else {
     entity_recycle(state, entity);
+  }
+}
+
+void remove_selected_entites(state_t *state) {
+  for (entity_t *entity = state->entities; entity != NULL;
+       entity = entity->next) {
+    if (entity->flags & entity_flag_selected) {
+      remove_entity(state, entity);
+    }
   }
 }
 
@@ -319,7 +352,11 @@ void create_entity(state_t *state) {
       entity_t *entity = entity_alloc(state, 2);
       entity->flags = entity_flag_rect;
       *point_list_push(&entity->points) = state->drag_start;
+      *point_list_push(&entity->points) =
+          (ImVec2){io->MousePos.x, state->drag_start.y};
       *point_list_push(&entity->points) = io->MousePos;
+      *point_list_push(&entity->points) =
+          (ImVec2){state->drag_start.x, io->MousePos.y};
       push_entity(state, entity);
     }
 
@@ -328,14 +365,81 @@ void create_entity(state_t *state) {
   }
 }
 
-entity_t *find_selected_entity(entity_t *entities, const ImVec2 *mouse_pos) {
-  for (entity_t *entity = entities; entity != NULL; entity = entity->next) {
+typedef struct {
+  entity_t *selected_entity;
+  bool should_clear_prev_selection;
+} select_single_entity_result_t;
+
+void select_entity_near_mouse(select_single_entity_result_t *result,
+                              state_t *state, const ImVec2 *mouse_pos) {
+  size_t selected_entities_count = 0;
+  bool should_clear_prev_selection = true;
+
+  for (entity_t *entity = state->entities; entity != NULL;
+       entity = entity->next) {
+    const bool is_prev_selected = entity->flags & entity_flag_selected;
+
     if (entity->flags & entity_flag_rect) {
       ImVec2 *top_left = &entity->points.items[0];
-      ImVec2 *bottom_right = &entity->points.items[1];
+      ImVec2 *bottom_right = &entity->points.items[2];
 
-      if (mouse_pos->x >= top_left->x && mouse_pos->x <= bottom_right->x &&
-          mouse_pos->y >= top_left->y && mouse_pos->y <= bottom_right->y) {
+      if (vec2_is_in_area(mouse_pos, top_left, bottom_right)) {
+        if (is_prev_selected) {
+          should_clear_prev_selection = false;
+        } else {
+          entity->flags |= entity_flag_selected;
+        }
+        selected_entities_count++;
+      } else if (is_prev_selected) {
+        if (should_clear_prev_selection) {
+          entity->flags &= ~entity_flag_selected;
+        } else {
+          selected_entities_count++;
+        }
+      }
+    } else if (entity->flags & entity_flag_path) {
+      for (size_t i = 1; i < entity->points.length; ++i) {
+        ImVec2 *current_point = &entity->points.items[i];
+        ImVec2 *last_point = &entity->points.items[i - 1];
+
+        ImVec2 mouse_pos_proj;
+        project_point_to_segment(&mouse_pos_proj, last_point, current_point,
+                                 mouse_pos);
+
+        ImVec2 mouse_pos_delta_to_segment = {mouse_pos_proj.x - mouse_pos->x,
+                                             mouse_pos_proj.y - mouse_pos->y};
+
+        float magnitude_sqr = vec2_magnitude_sqr(&mouse_pos_delta_to_segment);
+        if (magnitude_sqr <= SELECT_THRESHOLD) {
+          if (is_prev_selected) {
+            should_clear_prev_selection = false;
+          } else {
+            entity->flags |= entity_flag_selected;
+          }
+          selected_entities_count++;
+          break;
+        } else if (is_prev_selected) {
+          if (should_clear_prev_selection) {
+            entity->flags &= ~entity_flag_selected;
+          } else {
+            selected_entities_count++;
+          }
+        }
+      }
+    }
+  }
+
+  state->selected_entities_count = selected_entities_count;
+}
+
+entity_t *find_entity_near_mouse(state_t *state, const ImVec2 *mouse_pos) {
+  for (entity_t *entity = state->entities; entity != NULL;
+       entity = entity->next) {
+    if (entity->flags & entity_flag_rect) {
+      ImVec2 *top_left = &entity->points.items[0];
+      ImVec2 *bottom_right = &entity->points.items[2];
+
+      if (vec2_is_in_area(mouse_pos, top_left, bottom_right)) {
         return entity;
       }
     } else if (entity->flags & entity_flag_path) {
@@ -359,6 +463,31 @@ entity_t *find_selected_entity(entity_t *entities, const ImVec2 *mouse_pos) {
   }
 
   return NULL;
+}
+
+void select_entities_in_area(state_t *state, const ImVec2 *top_left,
+                             const ImVec2 *bottom_right) {
+  bool has_selected_entities = false;
+
+  for (entity_t *entity = state->entities; entity != NULL;
+       entity = entity->next) {
+    const size_t no_of_points = entity->points.length;
+    bool found = false;
+    for (size_t i = 0; i < no_of_points; ++i) {
+      if (vec2_is_in_area(entity->points.items + i, top_left, bottom_right)) {
+        found = true;
+        break;
+      }
+    }
+    if (found) {
+      has_selected_entities = true;
+      entity->flags |= entity_flag_selected;
+    } else {
+      entity->flags &= ~entity_flag_selected;
+    }
+  }
+
+  state->selected_entities_count = has_selected_entities;
 }
 
 // ============================================================================
@@ -448,7 +577,7 @@ static void frame(void) {
               ImGuiWindowFlags_NoBringToFrontOnFocus);
 
   ImDrawList *draw_list = igGetWindowDrawList();
-  struct ImGuiIO *io = igGetIO();
+  ImGuiIO *io = igGetIO();
 
   igInvisibleButton("canvas", viewport->WorkSize, ImGuiButtonFlags_None);
 
@@ -468,26 +597,124 @@ static void frame(void) {
     state.is_prev_dragging = false;
   }
 
+  ImVec2 move_entity_by = {0, 0};
+  bool is_moving_entities = false;
+  entity_t *selected_entity = NULL;
+  bool should_clear_prev_selections = false;
+
   switch (state.selected_toolbox_button) {
   default:
     break;
 
   case toolbox_button_select: {
-    if (state.is_dragging && !state.is_prev_dragging) {
-      state.selected_entity =
-          find_selected_entity(state.entites, &io->MousePos);
-    } else if (state.is_dragging && state.selected_entity) {
-      float delta_x = io->MousePos.x - state.last_mouse_pos.x;
-      float delta_y = io->MousePos.y - state.last_mouse_pos.y;
-      const size_t no_of_points = state.selected_entity->points.length;
-      for (size_t i = 0; i < no_of_points; ++i) {
-        ImVec2 *pt = state.selected_entity->points.items + i;
-        pt->x += delta_x;
-        pt->y += delta_y;
+    if (state.is_dragging) {
+      if (!state.is_prev_dragging) {
+        selected_entity = find_entity_near_mouse(&state, &io->MousePos);
+        if (selected_entity) {
+          if ((selected_entity->flags & entity_flag_selected) == 0) {
+            should_clear_prev_selections = true;
+            selected_entity->flags |= entity_flag_selected;
+          }
+          state.has_selected_entities = true;
+        } else {
+          should_clear_prev_selections = true;
+          state.has_selected_entities = false;
+        }
+      } else if (state.has_selected_entities && !state.is_area_selecting) {
+        selected_entity = find_entity_near_mouse(&state, &io->MousePos);
+        if (selected_entity && selected_entity->flags & entity_flag_selected) {
+          is_moving_entities = true;
+          move_entity_by.x = io->MousePos.x - state.last_mouse_pos.x;
+          move_entity_by.y = io->MousePos.y - state.last_mouse_pos.y;
+        }
+      } else {
+        state.is_area_selecting = true;
+        select_entities_in_area(&state, &state.drag_start, &io->MousePos);
+      }
+    } else {
+      if (state.is_area_selecting) {
+        state.is_area_selecting = false;
       }
     }
     break;
   }
+  }
+
+  if (igIsKeyPressed_Bool(ImGuiKey_Backspace, false)) {
+    remove_selected_entites(&state);
+    state.has_selected_entities = false;
+  }
+
+  //======= draw entities to canvas =========
+
+  for (entity_t *entity = state.entities; entity != NULL;
+       entity = entity->next) {
+    bool is_selected;
+    if (should_clear_prev_selections && entity != selected_entity) {
+      is_selected = false;
+      entity->flags &= ~entity_flag_selected;
+    } else {
+      is_selected = entity->flags & entity_flag_selected;
+    }
+
+    if (entity->flags & entity_flag_path) {
+      for (size_t i = 1; i < entity->points.length; ++i) {
+        ImVec2 *current_point = &entity->points.items[i];
+        ImVec2 *last_point = &entity->points.items[i - 1];
+
+        if (is_selected) {
+          if (i == 1) {
+            vec2_move(last_point, &move_entity_by);
+          }
+          vec2_move(current_point, &move_entity_by);
+        }
+
+        ImU32 color =
+            (entity->flags & entity_flag_selected) ? 0xFF0000FF : 0xFFFFFFFF;
+        ImDrawList_AddLine(draw_list, *last_point, *current_point, color, 2);
+      }
+    } else if (entity->flags & entity_flag_rect) {
+      if (is_selected) {
+        vec2_move(entity->points.items, &move_entity_by);
+        vec2_move(entity->points.items + 2, &move_entity_by);
+      }
+
+      ImDrawList_AddRectFilled(draw_list, entity->points.items[0],
+                               entity->points.items[2], 0xFFFFFFFF, 0.0,
+                               ImDrawFlags_None);
+
+      if (is_selected) {
+        ImDrawList_AddRect(draw_list, entity->points.items[0],
+                           entity->points.items[2],
+                           igGetColorU32_Vec4((ImVec4){0.537, 0.706, 1, 1}),
+                           0.0, ImDrawFlags_None, 2.0);
+      }
+    }
+  }
+
+  igSetNextWindowPos((ImVec2){io->DisplaySize.x * 0.5, 16}, ImGuiCond_Always,
+                     (ImVec2){0.5, 0});
+
+  toolbox_window();
+
+  switch (state.selected_toolbox_button) {
+  default:
+    break;
+
+  case toolbox_button_select: {
+    if (state.is_dragging && state.is_prev_dragging && !is_moving_entities) {
+      ImDrawList_AddRect(draw_list, state.drag_start, io->MousePos, 0xFFFFFFFF,
+                         0.0f, ImDrawFlags_None, 1);
+    }
+    break;
+  }
+
+  case toolbox_button_rectangle:
+    if (state.is_dragging) {
+      ImDrawList_AddRectFilled(draw_list, state.drag_start, io->MousePos,
+                               0xFFFFFFFF, 0.0f, ImDrawFlags_None);
+    }
+    break;
 
   case toolbox_button_draw: {
     if (state.is_dragging && (state.last_mouse_pos.x != io->MousePos.x ||
@@ -502,50 +729,7 @@ static void frame(void) {
 
     break;
   }
-
-  case toolbox_button_rectangle:
-    if (state.is_dragging) {
-      ImDrawList_AddRectFilled(draw_list, state.drag_start, io->MousePos,
-                               0xFFFFFFFF, 0.0f, ImDrawFlags_None);
-    }
   }
-
-  if (igIsKeyPressed_Bool(ImGuiKey_Backspace, false)) {
-    if (state.selected_entity) {
-      remove_entity(&state, state.selected_entity);
-      state.selected_entity = NULL;
-    }
-  }
-
-  //======= draw entities to canvas =========
-
-  for (entity_t *entity = state.entites; entity != NULL;
-       entity = entity->next) {
-    if (entity->flags & entity_flag_path) {
-      for (size_t i = 1; i < entity->points.length; ++i) {
-        ImVec2 *current_point = &entity->points.items[i];
-        ImVec2 *last_point = &entity->points.items[i - 1];
-        ImU32 color = entity == state.selected_entity ? 0xFF0000FF : 0xFFFFFFFF;
-        ImDrawList_AddLine(draw_list, *last_point, *current_point, color, 2);
-      }
-    } else if (entity->flags & entity_flag_rect) {
-      ImDrawList_AddRectFilled(draw_list, entity->points.items[0],
-                               entity->points.items[1], 0xFFFFFFFF, 0.0,
-                               ImDrawFlags_None);
-
-      if (state.selected_entity == entity) {
-        ImDrawList_AddRect(draw_list, entity->points.items[0],
-                           entity->points.items[1],
-                           igGetColorU32_Vec4((ImVec4){0.537, 0.706, 1, 1}),
-                           0.0, ImDrawFlags_None, 2.0);
-      }
-    }
-  }
-
-  igSetNextWindowPos((ImVec2){io->DisplaySize.x * 0.5, 16}, ImGuiCond_Always,
-                     (ImVec2){0.5, 0});
-
-  toolbox_window();
 
   state.last_mouse_pos = io->MousePos;
 
