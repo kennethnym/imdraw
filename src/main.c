@@ -682,7 +682,9 @@ static void frame(void) {
     } else if (entity->flags & entity_flag_rect) {
       if (is_selected) {
         vec2_move(entity->points.items, &move_entity_by);
+        vec2_move(entity->points.items + 1, &move_entity_by);
         vec2_move(entity->points.items + 2, &move_entity_by);
+        vec2_move(entity->points.items + 3, &move_entity_by);
       }
 
       ImU32 fill_color;
