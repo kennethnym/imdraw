@@ -651,7 +651,6 @@ static void frame(void) {
         fill_color = current_picked_color;
         entity->color = state.picked_color;
       } else {
-        fill_color = current_picked_color;
         fill_color = igGetColorU32_Vec4(entity->color.Value);
       }
 
@@ -691,7 +690,6 @@ static void frame(void) {
         fill_color = current_picked_color;
         entity->color = state.picked_color;
       } else {
-        fill_color = current_picked_color;
         fill_color = igGetColorU32_Vec4(entity->color.Value);
       }
 
