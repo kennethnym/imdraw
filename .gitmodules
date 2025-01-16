@@ -3,4 +3,4 @@
 	url = https://github.com/floooh/sokol.git
 [submodule "vendor/cimgui"]
 	path = vendor/cimgui
-	url = https://github.com/cimgui/cimgui.git
+	url = https://code.kennethnym.com/kennethnym/cimgui.git
