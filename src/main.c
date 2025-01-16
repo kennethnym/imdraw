@@ -8,11 +8,13 @@
 #include "sokol_glue.h"
 #include "sokol_imgui.h"
 #include "sokol_log.h"
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 // if mouse movement between mouse down and mouse up is below this threshold (in
 // px) then it is considered to be a mouse click
@@ -147,7 +149,6 @@ void *arena_push(arena_t *arena, size_t size) {
     arena_page_t *new_page = arena_new_page(arena->capacity);
     new_page->next = arena->page;
     arena->page = new_page;
-    printf("arena realloc\n");
   }
   void *ptr = arena->page->data + arena->page->end_ptr;
   arena->page->end_ptr += size;
@@ -161,6 +162,32 @@ void arena_free(arena_t *arena) {
     free(page);
   }
   free(arena);
+}
+
+// ===========================
+// struct: string
+// ===========================
+
+typedef struct {
+  char *data;
+  size_t length;
+  size_t capacity;
+} growable_string_t;
+
+growable_string_t growable_string_alloc(size_t capacity) {
+  char *data = malloc(sizeof(char) * capacity);
+  return (growable_string_t){
+      .data = data,
+      .length = 0,
+      .capacity = capacity,
+  };
+}
+
+void growable_string_grow(growable_string_t *str, size_t additional_bytes) {
+  if (str->length + additional_bytes >= str->capacity) {
+    str->capacity = str->capacity * 2 + additional_bytes;
+    str->data = realloc(str->data, sizeof(char) * str->capacity);
+  }
 }
 
 // ===========================
@@ -209,14 +236,19 @@ void point_list_free(point_list_t *list) { free(list->items); }
 typedef enum {
   entity_flag_rect = 1 << 0,
   entity_flag_path = 1 << 1,
-  entity_flag_selected = 1 << 2,
+  entity_flag_editable_text = 1 << 2,
+  entity_flag_selected = 1 << 3,
+  entity_flag_active = 1 << 4,
 } entity_flag_t;
 
 typedef struct entity {
+  int id;
   entity_flag_t flags;
 
   point_list_t points;
+  ImVec2 dimension;
   ImColor color;
+  char content[512];
 
   struct entity *next;
   struct entity *prev;
@@ -242,10 +274,11 @@ typedef struct {
 // ===========================
 
 typedef enum {
-  toolbox_button_select,
-  toolbox_button_draw,
-  toolbox_button_rectangle,
-} toolbox_button_kind_t;
+  tool_select,
+  tool_draw,
+  tool_rectangle,
+  tool_text,
+} tool_t;
 
 typedef struct {
   arena_t *arena;
@@ -269,7 +302,7 @@ typedef struct {
   ImVec2 drag_start;
   ImVec2 last_mouse_pos;
 
-  toolbox_button_kind_t selected_toolbox_button;
+  tool_t current_tool;
   bool is_color_picker_changing;
   ImColor picked_color;
 } state_t;
@@ -315,7 +348,8 @@ void remove_selected_entites(state_t *state) {
       entity_recycle(state, last_removed_entity);
       last_removed_entity = NULL;
     }
-    if (entity->flags & entity_flag_selected) {
+    if (entity->flags & entity_flag_selected &&
+        (entity->flags & entity_flag_active) == 0) {
       if (state->entities == entity) {
         state->entities = entity->next;
       }
@@ -345,13 +379,14 @@ void remove_selected_entites(state_t *state) {
 void create_entity(state_t *state) {
   const ImGuiIO *io = igGetIO();
 
-  switch (state->selected_toolbox_button) {
+  switch (state->current_tool) {
   default:
     break;
 
-  case toolbox_button_draw: {
+  case tool_draw: {
     if (vec2_distance_sqr(&state->drag_start, &io->MousePos) > 100) {
       entity_t *entity = entity_alloc(state, state->points.capacity);
+      entity->id = rand();
       entity->flags = entity_flag_path;
       entity->color = state->picked_color;
       point_list_copy(&entity->points, &state->points);
@@ -363,20 +398,48 @@ void create_entity(state_t *state) {
     break;
   }
 
-  case toolbox_button_rectangle: {
+  case tool_rectangle: {
     if (vec2_distance_sqr(&state->drag_start, &io->MousePos) > 625) {
       entity_t *entity = entity_alloc(state, 2);
+      entity->id = rand();
       entity->flags = entity_flag_rect;
       entity->color = state->picked_color;
+
       *point_list_push(&entity->points) = state->drag_start;
       *point_list_push(&entity->points) =
           (ImVec2){io->MousePos.x, state->drag_start.y};
       *point_list_push(&entity->points) = io->MousePos;
       *point_list_push(&entity->points) =
           (ImVec2){state->drag_start.x, io->MousePos.y};
+
       push_entity(state, entity);
     }
 
+    break;
+  }
+
+  case tool_text: {
+    if (vec2_distance_sqr(&state->drag_start, &io->MousePos) > 625) {
+      entity_t *entity = entity_alloc(state, 4);
+      entity->id = rand();
+      entity->flags = entity_flag_editable_text | entity_flag_selected;
+      entity->color = state->picked_color;
+      memcpy(entity->content, "Text", 4);
+
+      ImGuiContext *gui_ctx = GImGui;
+
+      entity->dimension.x = fabs(io->MousePos.x - state->drag_start.x);
+      entity->dimension.y = fabs(io->MousePos.y - state->drag_start.y);
+
+      *point_list_push(&entity->points) = state->drag_start;
+      *point_list_push(&entity->points) =
+          (ImVec2){io->MousePos.x, state->drag_start.y};
+      *point_list_push(&entity->points) = io->MousePos;
+      *point_list_push(&entity->points) =
+          (ImVec2){state->drag_start.x, io->MousePos.y};
+
+      push_entity(state, entity);
+    }
     break;
   }
   }
@@ -501,7 +564,7 @@ static void init(void) {
   state.pass_action.colors[0].load_action = SG_LOADACTION_CLEAR;
   state.selected_entity = NULL;
   state.has_selected_entities = false;
-  state.selected_toolbox_button = toolbox_button_select;
+  state.current_tool = tool_select;
   state.picked_color = *ImColor_ImColor_U32(0xFFFFFFFF);
   state.color_picker_window_size.x = 0;
   state.color_picker_window_size.y = 0;
@@ -509,6 +572,7 @@ static void init(void) {
 
 static void toolbox_window(void);
 static void color_picker_window(void);
+static int on_input_text_event(ImGuiInputTextCallbackData *event);
 
 static void frame(void) {
   simgui_new_frame(&(simgui_frame_desc_t){
@@ -547,6 +611,9 @@ static void frame(void) {
     state.is_mouse_down = false;
     if (state.is_prev_mouse_down) {
       create_entity(&state);
+      if (state.current_tool == tool_text) {
+        state.current_tool = tool_select;
+      }
     }
     state.is_prev_mouse_down = false;
   }
@@ -556,11 +623,11 @@ static void frame(void) {
   bool should_clear_prev_selections = false;
   ImU32 current_picked_color = igGetColorU32_Vec4(state.picked_color.Value);
 
-  switch (state.selected_toolbox_button) {
+  switch (state.current_tool) {
   default:
     break;
 
-  case toolbox_button_select: {
+  case tool_select: {
     if (state.is_mouse_down &&
         !vec2_is_in_area(&io->MousePos,
                          &state.color_picker_window.position_top_left,
@@ -611,6 +678,8 @@ static void frame(void) {
 
   toolbox_window();
 
+  // ======== calculate color picker window position ========
+
   if (state.color_picker_window.dimension.x > 0) {
     ImVec2 *top_left = &state.color_picker_window.position_top_left;
     ImVec2 *bottom_right = &state.color_picker_window.position_bottom_right;
@@ -644,6 +713,9 @@ static void frame(void) {
     } else {
       is_selected = entity->flags & entity_flag_selected;
     }
+
+    igPushID_Int(entity->id);
+    printf("entity id %d\n", entity->id);
 
     if (entity->flags & entity_flag_path) {
       ImU32 fill_color;
@@ -705,14 +777,37 @@ static void frame(void) {
                            igGetColorU32_Vec4((ImVec4){0.537, 0.706, 1, 1}),
                            0.0, ImDrawFlags_None, 2.0);
       }
+    } else if (entity->flags & entity_flag_editable_text) {
+      ImVec2 cursor_pos;
+      igGetCursorPos(&cursor_pos);
+
+      igSetCursorPos(entity->points.items[0]);
+
+      igPushStyleColor_U32(ImGuiCol_FrameBg, 0);
+
+      igInputTextMultiline("##text", entity->content, 512, entity->dimension,
+                           ImGuiInputTextFlags_NoHorizontalScroll |
+                               ImGuiInputTextFlags_CallbackEdit,
+                           on_input_text_event, entity);
+
+      igPopStyleColor(1);
+
+      if (is_selected) {
+        ImDrawList_AddRect(draw_list, entity->points.items[0],
+                           entity->points.items[2],
+                           igGetColorU32_Vec4((ImVec4){0.537, 0.706, 1, 1}),
+                           0.0, ImDrawFlags_None, 2.0);
+      }
     }
+
+    igPopID();
   }
 
-  switch (state.selected_toolbox_button) {
+  switch (state.current_tool) {
   default:
     break;
 
-  case toolbox_button_select: {
+  case tool_select: {
     if (state.is_mouse_down && state.is_prev_mouse_down &&
         !state.is_moving_entities) {
       ImDrawList_AddRect(draw_list, state.drag_start, io->MousePos, 0xFFFFFFFF,
@@ -721,7 +816,7 @@ static void frame(void) {
     break;
   }
 
-  case toolbox_button_rectangle:
+  case tool_rectangle:
     if (state.is_mouse_down) {
       ImDrawList_AddRectFilled(draw_list, state.drag_start, io->MousePos,
                                igGetColorU32_Vec4(state.picked_color.Value),
@@ -729,7 +824,7 @@ static void frame(void) {
     }
     break;
 
-  case toolbox_button_draw: {
+  case tool_draw: {
     if (state.is_mouse_down && (state.last_mouse_pos.x != io->MousePos.x ||
                                 state.last_mouse_pos.y != io->MousePos.y)) {
       *point_list_push(&state.points) = io->MousePos;
@@ -742,6 +837,12 @@ static void frame(void) {
 
     break;
   }
+
+  case tool_text:
+    if (state.is_mouse_down && state.is_prev_mouse_down) {
+      ImDrawList_AddRect(draw_list, state.drag_start, io->MousePos, 0xFFFFFFFF,
+                         0.0f, ImDrawFlags_None, 1);
+    }
   }
 
   state.last_mouse_pos = io->MousePos;
@@ -769,16 +870,15 @@ static void toolbox_window(void) {
   igBegin("t", 0, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoTitleBar);
 
   if (selectable_button(ICON_FA_MOUSE_POINTER, button_size,
-                        state.selected_toolbox_button ==
-                            toolbox_button_select)) {
-    state.selected_toolbox_button = toolbox_button_select;
+                        state.current_tool == tool_select)) {
+    state.current_tool = tool_select;
   };
 
   igSameLine(0, 4);
 
   if (selectable_button(ICON_FA_PENCIL, button_size,
-                        state.selected_toolbox_button == toolbox_button_draw)) {
-    state.selected_toolbox_button = toolbox_button_draw;
+                        state.current_tool == tool_draw)) {
+    state.current_tool = tool_draw;
   };
 
   igSameLine(0, 4);
@@ -786,10 +886,20 @@ static void toolbox_window(void) {
   igPushStyleVar_Vec2(ImGuiStyleVar_ButtonTextAlign, (ImVec2){0.8, 1});
 
   if (selectable_button(ICON_FA_SQUARE_O, button_size,
-                        state.selected_toolbox_button ==
-                            toolbox_button_rectangle)) {
-    state.selected_toolbox_button = toolbox_button_rectangle;
+                        state.current_tool == tool_rectangle)) {
+    state.current_tool = tool_rectangle;
   };
+
+  igPopStyleVar(1);
+
+  igSameLine(0, 4);
+
+  igPushStyleVar_Vec2(ImGuiStyleVar_ButtonTextAlign, (ImVec2){1, 0.8});
+
+  if (selectable_button(ICON_FA_FONT, button_size,
+                        state.current_tool == tool_text)) {
+    state.current_tool = tool_text;
+  }
 
   igPopStyleVar(3);
   igPopFont();
@@ -811,6 +921,10 @@ static void color_picker_window(void) {
   igEnd();
 }
 
+static int on_input_text_event(ImGuiInputTextCallbackData *data) {
+  printf("input text event\n");
+}
+
 static void cleanup(void) {
   simgui_shutdown();
   sg_shutdown();
@@ -819,6 +933,8 @@ static void cleanup(void) {
 static void event(const sapp_event *event) { simgui_handle_event(event); }
 
 sapp_desc sokol_main(int argc, char *argv[]) {
+  srand(time(NULL));
+
   return (sapp_desc){
       .init_cb = init,
       .frame_cb = frame,
